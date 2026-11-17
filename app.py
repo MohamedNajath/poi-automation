@@ -66,6 +66,17 @@ def norm_model(s):
     s = re.split(r"[(?\n]", str(s or ""))[0].upper().replace(" ", "")
     return re.sub(r"^(DHI|DH)-", "", s).replace("-", "")
 
+def parse_devices(txt):
+    """NVR/HDD rows. Works whether each row is one text line or each cell is its own line."""
+    m = re.search(r"NVR Details:?(.*?)(?:STORAGE CALC|SITE SURVEY REPORT|\b03:|$)", txt, re.S | re.I)
+    sec = re.sub(r"^.*?Qty\b", "", flat(m.group(1)), count=1) if m else ""
+    out = []
+    for mm in re.finditer(r"(?<!\S)(\d{1,2})\s+([A-Za-z]{2,8})\s+(.+?)\s+(\d{1,3})(?=\s+\d{1,2}\s+[A-Za-z]{2,8}\s|\s*$)", sec):
+        sn, dt, mid, q = mm.groups()
+        model, desc = (mid, mid) if dt.upper() == "HDD" else (mid.split(" ", 1) + [""])[:2]
+        out.append(dict(sn=sn, dtype=dt.upper(), model=model, desc=desc, qty=q, page=0))
+    return out
+
 def extract_pdf(data: bytes, filename: str) -> dict:
     w = []
     doc = fitz.open(stream=data, filetype="pdf")
@@ -129,7 +140,8 @@ def extract_pdf(data: bytes, filename: str) -> dict:
     with pdfplumber.open(io.BytesIO(data)) as pdf:
         for pi, page in enumerate(pdf.pages, 1):
             for tb in page.extract_tables():
-                rows = [[flat(c) for c in r] for r in tb if r]
+                rows = [[flat(c) for c in r if c is not None] for r in tb if r]
+                rows = [r for r in rows if r]
                 if not rows: continue
                 blob = " ".join(" ".join(r) for r in rows).lower(); n = len(rows[0])
                 has_data = any(r[0].isdigit() for r in rows)
@@ -142,6 +154,7 @@ def extract_pdf(data: bytes, filename: str) -> dict:
                                          camera=r[5], lens=r[6], itype=r[7], env=r[8], page=pi))
                     elif is_dev and len(r) >= 5:
                         devs.append(dict(sn=r[0], dtype=r[1], model=r[2], desc=r[3], qty=r[4], page=pi))
+    devs = parse_devices(alltxt) or devs
     rec["cameras"], rec["devices"] = cams, devs
     if not cams: w.append("No camera table found")
     if not devs: w.append("No NVR/HDD table found")
@@ -235,16 +248,19 @@ def resolve_equipment(rec, info):
             elif n in info["models"]: add(info["models"][n])
             else: w.append(f"{kind} '{cam[kind]}' not found in master columns")
         t = cam["itype"].upper()
-        key = "WALL" if "WALL" in t else "CEILING" if "CEIL" in t else "PENDANT" if "PEND" in t else None
+        key = ("WALL" if "WALL" in t else "CEILING" if "CEIL" in t else "PENDANT" if "PEND" in t
+               else "POLE" if "POLE" in t else None)
         outdoor = "OUT" in cam["env"].upper()
-        if not key: w.append(f"Camera {cam['sn']}: installation type unclear ('{cam['itype']}')"); continue
         if outdoor:
             if info["housing"]: add(info["housing"])
             else: w.append("Outdoor housing column not found")
-            c = info["brk_out"].get(key)
-        else: c = info["brk_in"].get(key)
-        if c: add(c)
-        else: w.append(f"No bracket column for {'outdoor ' if outdoor else ''}{key}")
+        if key == "POLE":
+            w.append("Pole mount: the master has no pole bracket column - only the outdoor housing is counted. Add a bracket manually if needed.")
+        elif not key: w.append(f"Camera {cam['sn']}: installation type unclear ('{cam['itype']}')")
+        else:
+            c = (info["brk_out"] if outdoor else info["brk_in"]).get(key)
+            if c: add(c)
+            else: w.append(f"No bracket column for {'outdoor ' if outdoor else ''}{key}")
     for d in rec["devices"]:
         q = int(d["qty"]) if str(d["qty"]).isdigit() else 1
         if re.search(r"HDD|HARD", d["dtype"].upper()):
